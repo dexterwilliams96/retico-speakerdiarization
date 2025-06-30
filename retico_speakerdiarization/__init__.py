@@ -1,0 +1,3 @@
+from retico_speakerdiarization.speaker_diarization import *
+
+from retico_speakerdiarization.version import __version__
