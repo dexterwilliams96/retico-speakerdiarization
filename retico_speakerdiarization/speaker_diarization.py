@@ -323,12 +323,19 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
                     for i, iu in enumerate(self.current_output):
                         speaker_id = cluster_ids[len(
                             self.sd.embedding_buffer) - (1 + i)]
+                        if i > 0 and i < len(self.current_output) - 1:
+                            # Lazy: assume if only a single chunk is different, it is the same speaker
+                            if cluster_ids[i - 1] != speaker_id and cluster_ids[i + 1] != speaker_id:
+                                speaker_id = cluster_ids[i - 1]
                         if speaker_id != iu.speaker:
-                            new_iu = self.create_iu(iu.creator)
+                            new_iu = self.create_iu(iu)
+                            self.revoke(iu)
                             um.add_iu(iu, retico_core.UpdateType.REVOKE)
                             new_iu.set_speaker(speaker_id)
+                            self.commit(new_iu)
                             um.add_iu(new_iu, retico_core.UpdateType.COMMIT)
                         else:
+                            self.commit(iu)
                             um.add_iu(iu, retico_core.UpdateType.COMMIT)
                 for iu in self.current_output:
                     self.commit(iu)
