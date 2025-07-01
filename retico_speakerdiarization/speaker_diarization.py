@@ -6,11 +6,47 @@ import time
 import torch
 import webrtcvad
 
+from ignite.metrics.clustering import SilhouetteScore
 from pyannote.audio import Inference, Model
+from retico_core import abstract
 from retico_core.audio import AudioIU
 from retico_core.text import SpeechRecognitionIU
-from scipy.spatial.distance import cosine
 from torch.nn.functional import normalize
+
+# Buffer for embeddings
+# Every time a buffer is added check which cluster it belongs to
+# If we have no clusters, assign a dummy one
+# After computing 10 embeddings, compute optimal cluster number
+# Compute centroids and reassign labels then commit
+# Each new ten received, add labels based on existing centroids, compute new optimal number, compute new centroids
+# When computing new centroids maintain previous labels
+# Once we receive 100 embeddings, prune, delete embeddings but maintain relevant ones for each centroid, maintain at least 10 embeddings per centroid
+
+
+class SpeakerIU(abstract.IncrementalUnit):
+    """An Incremental Unit representing a speaker in the audio stream."""
+
+    @staticmethod
+    def type():
+        return "Speaker Incremental Unit"
+
+    def __init__(self, creator=None, iuid=0, previous_iu=None, grounded_in=None,
+                 payload=None, decision=None, speaker=None, **kwargs):
+        super().__init__(creator=creator, iuid=iuid, previous_iu=previous_iu,
+                         grounded_in=grounded_in, payload=payload, decision=decision, **kwargs)
+        self.speaker = speaker
+
+    def set_speaker(self, speaker):
+        """Set the speaker of the IU.
+
+        Args:
+            speaker (int): The ID of the speaker.
+        """
+        self.speaker = speaker
+        self.payload = {'speaker': speaker}
+
+    def __repr__(self):
+        return f"{self.type()} - {self.creator.name()}: {self.payload['speaker']}"
 
 
 class SpeakerDiarization:
@@ -23,15 +59,30 @@ class SpeakerDiarization:
         device="cuda" if torch.cuda.is_available() else "cpu",
         max_new_tokens=256,
         use_cache=True,
-        similiarity_threshold=0.5,
+        similiarity_threshold=0.8,
+        upper_cluster_bound=5,
+        max_k_means_iterations=10,
+        max_buffer_size=100,
+        min_buffer_size=10,
     ):
+        # Initialize speaker embedding model
         self.device = device
         model_id = "pyannote/embedding"
         model = Model.from_pretrained(model_id)
         self.model = Inference(model, window="whole").to(
             torch.device(self.device))
-        self.speakers = {}
+
+        # Speaker embedding related
+        self.embedding_buffer = []
         self.similiarity_threshold = similiarity_threshold
+        self.use_k_means = False
+        self.centroids = None
+        self.upper_cluster_bound = upper_cluster_bound
+        self.max_k_means_iterations = max_k_means_iterations
+        self.max_buffer_size = max_buffer_size
+        self.min_buffer_size = min_buffer_size
+
+        # Audio related
         self.audio_buffer = []
         self.framerate = framerate
         self.vad = webrtcvad.Vad(vad_agressiveness)
@@ -41,6 +92,93 @@ class SpeakerDiarization:
         self.silence_threshold = silence_threshold
         self.max_new_tokens = max_new_tokens
         self._temp_audio_array = None
+
+    def _compute_centroids(self, k):
+        # K-means clustering over speaker embeddings
+        embeddings = torch.stack(self.embedding_buffer).to(self.device)
+        centroids = embeddings[torch.randperm(
+            embeddings.size(0), device=self.device)[:k]]
+        for _ in range(self.max_k_means_iterations):
+            centroids_norm = normalize(centroids, dim=1)
+            sim = torch.matmul(embeddings, centroids_norm.T)
+            cluster_ids = sim.argmax(dim=1)
+            for i in range(k):
+                labels = embeddings[cluster_ids == i]
+                if len(labels) > 0:
+                    centroids[i] = labels.mean(dim=0)
+        return centroids, cluster_ids
+
+    def _map_cluster_ids(self, best_centroids, cluster_ids):
+        all_scores = [[] for _ in range(len(self.centroids))]
+        for old_id, old_centroid in enumerate(self.centroids):
+            scores = [0 for _ in range(len(best_centroids))]
+            for new_id, centroid in enumerate(best_centroids):
+                sim = torch.dot(centroid, old_centroid)
+                scores[new_id] = sim.item()
+            all_scores[old_id] = scores
+        # Get best score for each id
+        used = set()
+        cluster_mapping = [0 for _ in range(len(best_centroids))]
+        for _ in range(len(self.centroids)):
+            best_score = -float('inf')
+            best_new_id = None
+            best_old_id = None
+            for old_id, scores in enumerate(all_scores):
+                for new_id, score in enumerate(scores):
+                    if new_id not in used and (best_new_id is None or score > best_score):
+                        best_score = score
+                        best_new_id = new_id
+                        best_old_id = old_id
+            if best_new_id is not None:
+                used.add(best_new_id)
+                cluster_mapping[best_new_id] = best_old_id
+        # If any new centroids are not mapped, we should create new centroids
+        diff = set((cluster_ids).tolist()) - used
+        max_id = max(cluster_mapping)
+        for new_id in diff:
+            max_id += 1
+            cluster_mapping[new_id] = max_id
+        # Map cluster ids to new ids
+        for new_id, old_id in enumerate(cluster_mapping):
+            cluster_ids[cluster_ids == old_id] = cluster_mapping[new_id]
+        return cluster_ids
+
+    def get_best_centroids(self):
+        coef = SilhouetteScore(device=self.device)
+        best_centroids = None
+        best_cluster_ids = None
+        best_score = -1
+        for k in range(2, self.upper_cluster_bound + 1):
+            centroids, cluster_ids = self._compute_centroids(k)
+            coef.reset()
+            embeddings = torch.stack(self.embedding_buffer).to(self.device)
+            coef.update((embeddings, cluster_ids))
+            score = coef.compute()
+            if best_centroids is None or score > best_score:
+                best_score = score
+                best_centroids = centroids
+                best_cluster_ids = cluster_ids
+        if self.centroids is not None:
+            best_cluster_ids = self._map_cluster_ids(
+                best_centroids, best_cluster_ids)
+        self.centroids = best_centroids
+        return best_cluster_ids
+
+    def _prune_embeddings(self):
+        # TODO cut down embeddings to size, maintain most important
+        # Keep 90 most recent embeddings
+        self.embedding_buffer = self.embedding_buffer[-90:]
+
+    def _add_embedding(self, embedding):
+        if len(self.embedding_buffer) >= self.max_buffer_size:
+            self.prune_embeddings()
+        self.embedding_buffer.append(embedding)
+
+    def _get_speaker_id(self, embedding):
+        if self.centroids is None:
+            return 0
+        sim = torch.matmul(self.centroids, embedding)
+        return sim.argmax().item()
 
     def _resample_audio(self, audio):
         if self.framerate != 16_000:
@@ -52,7 +190,7 @@ class SpeakerDiarization:
             return s._data
         return audio
 
-    def get_n_sil_frames(self):
+    def _get_n_sil_frames(self):
         if not self._n_sil_frames:
             if len(self.audio_buffer) == 0:
                 return None
@@ -61,8 +199,8 @@ class SpeakerDiarization:
                 self.silence_dur / (frame_length / 16_000))
         return self._n_sil_frames
 
-    def recognize_silence(self):
-        n_sil_frames = self.get_n_sil_frames()
+    def _recognize_silence(self):
+        n_sil_frames = self._get_n_sil_frames()
         if not n_sil_frames or len(self.audio_buffer) < n_sil_frames:
             return True
         silence_counter = 0
@@ -78,11 +216,11 @@ class SpeakerDiarization:
         self.audio_buffer.append(audio)
 
     def recognize(self):
-        silence = self.recognize_silence()
+        silence = self._recognize_silence()
         transcription = None
         if not self.vad_state and not silence:
             self.vad_state = True
-            self.audio_buffer = self.audio_buffer[-self.get_n_sil_frames():]
+            self.audio_buffer = self.audio_buffer[-self._get_n_sil_frames():]
 
         if not self.vad_state:
             return None, False
@@ -98,41 +236,25 @@ class SpeakerDiarization:
                         for a in self.audio_buffer]
         full_audio_np = np.concatenate(audio_arrays)
         npa = full_audio_np.astype(np.float32) / 32768.0
+
         # Get embedding and normalize
         embedding = normalize(torch.from_numpy(self.model({"waveform": torch.from_numpy(
-            npa).unsqueeze(0), "sample_rate": self.framerate})), dim=0)
-        # If there are no speakers, add the first one
-        if len(self.speakers) == 0:
-            self.speakers[f'SPEAKER_{len(self.speakers)}'] = {
-                "embedding": embedding, "count": 1}
-        else:
-            best_match = None
-            min_distance = float('inf')
-            for speaker, data in self.speakers.items():
-                dist = cosine(embedding, data["embedding"])
-                if dist < min_distance:
-                    min_distance = dist
-                    best_match = speaker
-            if min_distance < self.similiarity_threshold:
-                # Compute running average
-                self.speakers[best_match]["count"] += 1
-                self.speakers[best_match]["embedding"] = (
-                    (self.speakers[best_match]["embedding"] *
-                     self.speakers[best_match]["count"]) + embedding
-                ) / (self.speakers[best_match]["count"] + 1)
-                # Normalize the embedding
-                self.speakers[best_match]["embedding"] = normalize(
-                    self.speakers[best_match]["embedding"], dim=0)
-            else:
-                self.speakers[f'SPEAKER_{len(self.speakers)}'] = {
-                    "embedding": embedding,
-                    "count": 1,
-                }
-        print(self.speakers.keys())
+            npa).unsqueeze(0), "sample_rate": self.framerate})), dim=0).to(self.device)
+        self._add_embedding(embedding)
+        prediction = self._get_speaker_id(embedding)
+        # Check if we need to use k-means clustering
+        if not self.use_k_means and len(self.embedding_buffer) > 1:
+            embeddings = torch.stack(self.embedding_buffer).to(self.device)
+            sim = (embeddings.sum() - embeddings.diag().sum()) / \
+                (len(embeddings)**2 - len(embeddings))
+            if sim < self.similiarity_threshold:
+                self.use_k_means = True
+
         if silence:
             self.vad_state = False
             self.audio_buffer = []
-        return transcription, self.vad_state
+
+        return prediction, self.vad_state
 
     def reset(self):
         self.vad_state = True
@@ -154,17 +276,17 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
 
     @staticmethod
     def output_iu():
-        return SpeechRecognitionIU
+        return SpeakerIU
 
     def __init__(self, framerate=None, silence_dur=1, **kwargs):
         super().__init__(**kwargs)
 
-        self.asr = SpeakerDiarization(
+        self.sd = SpeakerDiarization(
             silence_dur=silence_dur,
         )
         self.framerate = framerate
         self.silence_dur = silence_dur
-        self._asr_thread_active = False
+        self._sd_thread_active = False
         self.latest_input_iu = None
 
     def process_update(self, update_message):
@@ -174,34 +296,40 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
                 continue
             if self.framerate is None:
                 self.framerate = iu.rate
-                self.asr.framerate = self.framerate
-            self.asr.add_audio(iu.raw_audio)
+                self.sd.framerate = self.framerate
+            self.sd.add_audio(iu.raw_audio)
             if not self.latest_input_iu:
                 self.latest_input_iu = iu
 
-    def _asr_thread(self):
-        while self._asr_thread_active:
+    def _sd_thread(self):
+        while self._sd_thread_active:
             time.sleep(0.5)
             if not self.framerate:
                 continue
-            prediction, vad = self.asr.recognize()
+            prediction, vad = self.sd.recognize()
             if prediction is None:
                 continue
-            end_of_utterance = not vad
-            um, new_tokens = retico_core.text.get_text_increment(
-                self, prediction)
 
-            if len(new_tokens) == 0 and vad:
-                continue
+            output_iu = self.create_iu(self.latest_input_iu)
+            output_iu.set_speaker(prediction)
+            self.current_output.append(output_iu)
+            um = retico_core.UpdateMessage()
+            um.add_iu(output_iu, retico_core.UpdateType.ADD)
 
-            for i, token in enumerate(new_tokens):
-                output_iu = self.create_iu(self.latest_input_iu)
-                eou = i == len(new_tokens) - 1 and end_of_utterance
-                output_iu.set_asr_results([prediction], token, 0.0, 0.99, eou)
-                self.current_output.append(output_iu)
-                um.add_iu(output_iu, retico_core.UpdateType.ADD)
-
-            if end_of_utterance:
+            if len(self.current_output) == self.sd.min_buffer_size:
+                # If we are using k-means, update centroids
+                if self.sd.use_k_means:
+                    cluster_ids = self.sd.get_best_centroids()
+                    for i, iu in enumerate(self.current_output):
+                        speaker_id = cluster_ids[len(
+                            self.sd.embedding_buffer) - (1 + i)]
+                        if speaker_id != iu.speaker:
+                            new_iu = self.create_iu(iu.creator)
+                            um.add_iu(iu, retico_core.UpdateType.REVOKE)
+                            new_iu.set_speaker(speaker_id)
+                            um.add_iu(new_iu, retico_core.UpdateType.COMMIT)
+                        else:
+                            um.add_iu(iu, retico_core.UpdateType.COMMIT)
                 for iu in self.current_output:
                     self.commit(iu)
                     um.add_iu(iu, retico_core.UpdateType.COMMIT)
@@ -211,10 +339,10 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
             self.append(um)
 
     def prepare_run(self):
-        self._asr_thread_active = True
+        self._sd_thread_active = True
         # Make thread daemon for cleaner shutdown
-        threading.Thread(target=self._asr_thread, daemon=True).start()
+        threading.Thread(target=self._sd_thread, daemon=True).start()
 
     def shutdown(self):
-        self._asr_thread_active = False
-        self.asr.reset()
+        self._sd_thread_active = False
+        self.sd.reset()
