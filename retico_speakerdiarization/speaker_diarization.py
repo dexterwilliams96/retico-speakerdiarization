@@ -50,10 +50,10 @@ class SpeakerDiarization:
         max_new_tokens=256,
         use_cache=True,
         similiarity_threshold=0.8,
-        upper_cluster_bound=5,
+        upper_cluster_bound=3,
         max_k_means_iterations=10,
         max_buffer_size=1000,
-        min_buffer_size=5,
+        min_buffer_size=8,
     ):
         # Initialize speaker embedding model
         self.device = device
@@ -141,6 +141,7 @@ class SpeakerDiarization:
         best_score = -1
         embeddings = torch.stack(self.embedding_buffer).to(self.device)
         for k in range(2, self.upper_cluster_bound + 1):
+            print(f"{k} clusters with {len(self.embedding_buffer)} embeddings")
             centroids, cluster_ids = self._compute_centroids(k)
             coef.reset()
             coef.update((embeddings, cluster_ids))
@@ -159,6 +160,7 @@ class SpeakerDiarization:
             return best_cluster_ids
         # Otherwise, use previous centroids
         else:
+            centroids = torch.stack(self.centroids).to(self.device)
             sim = torch.matmul(embeddings, centroids.T)
             cluster_ids = sim.argmax(dim=1)
             return cluster_ids
@@ -180,6 +182,7 @@ class SpeakerDiarization:
         elif len(self.centroids) == 1:
             self.solo_count = self.solo_count + 1
             self.centroids = [(self.centroids[0] * embedding / self.solo_count)]
+            return 0
         sim = torch.matmul(self.centroids, embedding)
         return sim.argmax().item()
 
