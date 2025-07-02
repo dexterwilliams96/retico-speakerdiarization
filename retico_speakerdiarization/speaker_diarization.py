@@ -49,11 +49,9 @@ class SpeakerDiarization:
         device="cuda" if torch.cuda.is_available() else "cpu",
         max_new_tokens=256,
         use_cache=True,
-        similiarity_threshold=0.8,
-        upper_cluster_bound=3,
-        max_k_means_iterations=10,
+        num_speakers=2,
+        similiarity_threshold=0.5,
         max_buffer_size=1000,
-        min_buffer_size=8,
     ):
         # Initialize speaker embedding model
         self.device = device
@@ -63,15 +61,10 @@ class SpeakerDiarization:
             torch.device(self.device))
 
         # Speaker embedding related
-        self.embedding_buffer = []
+        self.centroids = dict()
         self.similiarity_threshold = similiarity_threshold
-        self.use_k_means = False
-        self.centroids = None
-        self.solo_count = 0
-        self.upper_cluster_bound = upper_cluster_bound
-        self.max_k_means_iterations = max_k_means_iterations
+        self.num_speakers = num_speakers
         self.max_buffer_size = max_buffer_size
-        self.min_buffer_size = min_buffer_size
 
         # Audio related
         self.audio_buffer = []
@@ -84,107 +77,32 @@ class SpeakerDiarization:
         self.max_new_tokens = max_new_tokens
         self._temp_audio_array = None
 
-    def _compute_centroids(self, k):
-        # K-means clustering over speaker embeddings
-        embeddings = torch.stack(self.embedding_buffer).to(self.device)
-        centroids = embeddings[torch.randperm(
-            embeddings.size(0), device=self.device)[:k]]
-        for _ in range(self.max_k_means_iterations):
-            centroids_norm = normalize(centroids, dim=1)
-            sim = torch.matmul(embeddings, centroids_norm.T)
-            cluster_ids = sim.argmax(dim=1)
-            for i in range(k):
-                labels = embeddings[cluster_ids == i]
-                if len(labels) > 0:
-                    centroids[i] = labels.mean(dim=0)
-        return centroids, cluster_ids
-
-    def _map_cluster_ids(self, best_centroids, cluster_ids):
-        all_scores = [[] for _ in range(len(self.centroids))]
-        for old_id, old_centroid in enumerate(self.centroids):
-            scores = [0 for _ in range(len(best_centroids))]
-            for new_id, centroid in enumerate(best_centroids):
-                sim = torch.dot(centroid, old_centroid)
-                scores[new_id] = sim.item()
-            all_scores[old_id] = scores
-        # Get best score for each id
-        used = set()
-        cluster_mapping = [0 for _ in range(len(best_centroids))]
-        for _ in range(len(self.centroids)):
-            best_score = -float('inf')
-            best_new_id = None
-            best_old_id = None
-            for old_id, scores in enumerate(all_scores):
-                for new_id, score in enumerate(scores):
-                    if new_id not in used and (best_new_id is None or score > best_score):
-                        best_score = score
-                        best_new_id = new_id
-                        best_old_id = old_id
-            if best_new_id is not None:
-                used.add(best_new_id)
-                cluster_mapping[best_new_id] = best_old_id
-        # If any new centroids are not mapped, we should create new centroids
-        diff = set((cluster_ids).tolist()) - used
-        max_id = max(cluster_mapping)
-        for new_id in diff:
-            max_id += 1
-            cluster_mapping[new_id] = max_id
-        # Map cluster ids to new ids
-        for new_id, old_id in enumerate(cluster_mapping):
-            cluster_ids[cluster_ids == old_id] = cluster_mapping[new_id]
-        return cluster_ids
-
-    def get_best_centroids(self):
-        coef = SilhouetteScore(device=self.device)
-        best_centroids = None
-        best_cluster_ids = None
-        best_score = -1
-        embeddings = torch.stack(self.embedding_buffer).to(self.device)
-        for k in range(2, self.upper_cluster_bound + 1):
-            print(f"{k} clusters with {len(self.embedding_buffer)} embeddings")
-            centroids, cluster_ids = self._compute_centroids(k)
-            coef.reset()
-            coef.update((embeddings, cluster_ids))
-            score = coef.compute()
-            print(f"Score for {k} clusters: {score}")
-            if best_centroids is None or score > best_score:
-                best_score = score
-                best_centroids = centroids
-                best_cluster_ids = cluster_ids
-        # If score is high enough, use new centroids
-        if best_score >= self.similiarity_threshold:
-            if self.centroids is not None:
-                best_cluster_ids = self._map_cluster_ids(
-                    best_centroids, best_cluster_ids)
-            self.centroids = best_centroids
-            return best_cluster_ids
-        # Otherwise, use previous centroids
-        else:
-            centroids = torch.stack(self.centroids).to(self.device)
-            sim = torch.matmul(embeddings, centroids.T)
-            cluster_ids = sim.argmax(dim=1)
-            return cluster_ids
-
     def _prune_embeddings(self):
         # TODO cut down embeddings to size, maintain most important
-        # Keep 90 most recent embeddings
-        self.embedding_buffer = self.embedding_buffer[-90:]
+        pass
 
     def _add_embedding(self, embedding):
-        if len(self.embedding_buffer) >= self.max_buffer_size:
-            self._prune_embeddings()
-        self.embedding_buffer.append(embedding)
-
-    def _get_speaker_id(self, embedding):
-        if self.centroids is None:
-            self.centroids = [embedding]
-            return 0
-        elif len(self.centroids) == 1:
-            self.solo_count = self.solo_count + 1
-            self.centroids = [(self.centroids[0] * embedding / self.solo_count)]
-            return 0
-        sim = torch.matmul(self.centroids, embedding)
-        return sim.argmax().item()
+        if len(self.centroids) == 0:
+            self.centroids["SPEAKER 0"] = [embedding, 1]
+            return "SPEAKER 0"
+        else:
+            best_sim = -1
+            best_speaker = None
+            for speaker, (centroid, count) in self.centroids.items():
+                sim = torch.cosine_similarity(embedding, centroid, dim=0)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_speaker = speaker
+            best_centroid = self.centroids[best_speaker][0]
+            best_count = self.centroids[best_speaker][1]
+            if best_sim >= self.similiarity_threshold or len(self.centroids) == self.num_speakers:
+                self.centroids[best_speaker][1] = best_count + 1
+                self.centroids[best_speaker][0] = normalize((best_count * best_centroid + embedding) / (best_count + 1), dim=0)
+                return speaker
+            # If no similar speaker found, create a new one
+            new_speaker_id = f"SPEAKER {len(self.centroids)}"
+            self.centroids[new_speaker_id] = [embedding, 1]
+            return new_speaker_id
 
     def _resample_audio(self, audio):
         if self.framerate != 16_000:
@@ -223,7 +141,7 @@ class SpeakerDiarization:
 
     def recognize(self):
         silence = self._recognize_silence()
-        transcription = None
+        prediction = None
         if not self.vad_state and not silence:
             self.vad_state = True
             self.audio_buffer = self.audio_buffer[-self._get_n_sil_frames():]
@@ -243,13 +161,12 @@ class SpeakerDiarization:
         full_audio_np = np.concatenate(audio_arrays)
         npa = full_audio_np.astype(np.float32) / 32768.0
 
-        # Get embedding and normalize
-        embedding = normalize(torch.from_numpy(self.model({"waveform": torch.from_numpy(
-            npa).unsqueeze(0), "sample_rate": self.framerate})), dim=0).to(self.device)
-        self._add_embedding(embedding)
-        prediction = self._get_speaker_id(embedding)
 
         if silence:
+            # Get embedding and normalize
+            embedding = normalize(torch.from_numpy(self.model({"waveform": torch.from_numpy(
+                npa).unsqueeze(0), "sample_rate": self.framerate})), dim=0).to(self.device)
+            prediction = self._add_embedding(embedding)
             self.vad_state = False
             self.audio_buffer = []
 
@@ -285,7 +202,6 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
         )
         self.framerate = framerate
         self.silence_dur = silence_dur
-        self.has_been_silent = False
         self._sd_thread_active = False
         self.latest_input_iu = None
 
@@ -310,43 +226,12 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
             if prediction is None:
                 continue
             end_of_utterance = not vad
-            if end_of_utterance and not self.has_been_silent:
-                self.sd.use_k_means = True
 
             output_iu = self.create_iu(self.latest_input_iu)
             output_iu.set_speaker(prediction)
             self.current_output.append(output_iu)
             um = retico_core.UpdateMessage()
-            um.add_iu(output_iu, retico_core.UpdateType.ADD)
-
-            if end_of_utterance:
-                # If we are using k-means and have enough embeddings, update centroids
-                if self.sd.use_k_means and len(self.sd.embedding_buffer) >= self.sd.min_buffer_size:
-                    cluster_ids = self.sd.get_best_centroids()
-                    for i, iu in enumerate(self.current_output):
-                        speaker_id = cluster_ids[len(
-                            self.sd.embedding_buffer) - (1 + i)]
-                        if i > 0 and i < len(self.current_output) - 1:
-                            # Lazy: assume if only a single chunk is different, it is the same speaker
-                            if cluster_ids[i - 1] != speaker_id and cluster_ids[i + 1] != speaker_id:
-                                speaker_id = cluster_ids[i - 1]
-                        if speaker_id != iu.speaker:
-                            new_iu = self.create_iu(iu)
-                            self.revoke(iu)
-                            um.add_iu(iu, retico_core.UpdateType.REVOKE)
-                            new_iu.set_speaker(speaker_id)
-                            self.commit(new_iu)
-                            um.add_iu(new_iu, retico_core.UpdateType.COMMIT)
-                        else:
-                            self.commit(iu)
-                            um.add_iu(iu, retico_core.UpdateType.COMMIT)
-                else:
-                    for iu in self.current_output:
-                        self.commit(iu)
-                        um.add_iu(iu, retico_core.UpdateType.COMMIT)
-                self.has_been_silent = True
-                self.current_output = []
-
+            um.add_iu(output_iu, retico_core.UpdateType.COMMIT)
             self.latest_input_iu = None
             self.append(um)
 
