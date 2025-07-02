@@ -49,7 +49,8 @@ class SpeakerDiarization:
         device="cuda" if torch.cuda.is_available() else "cpu",
         max_new_tokens=256,
         use_cache=True,
-        similiarity_threshold=0.3,
+        num_speakers=2,
+        similiarity_threshold=0.5,
         max_buffer_size=1000,
     ):
         # Initialize speaker embedding model
@@ -62,6 +63,7 @@ class SpeakerDiarization:
         # Speaker embedding related
         self.centroids = dict()
         self.similiarity_threshold = similiarity_threshold
+        self.num_speakers = num_speakers
         self.max_buffer_size = max_buffer_size
 
         # Audio related
@@ -84,16 +86,23 @@ class SpeakerDiarization:
             self.centroids["SPEAKER 0"] = [embedding, 1]
             return "SPEAKER 0"
         else:
+            best_sim = -1
+            best_speaker = None
             for speaker, (centroid, count) in self.centroids.items():
                 sim = torch.cosine_similarity(embedding, centroid, dim=0)
-                print(sim)
-                if sim >= self.similiarity_threshold:
-                    self.centroids[speaker][1] = count + 1
-                    self.centroids[speaker][0] = normalize((count * centroid + embedding) / (count + 1), dim=0)
-                    return speaker
+                if sim > best_sim:
+                    best_sim = sim
+                    best_speaker = speaker
+            best_centroid = self.centroids[best_speaker][0]
+            best_count = self.centroids[best_speaker][1]
+            if best_sim >= self.similiarity_threshold or len(self.centroids) == self.num_speakers:
+                self.centroids[best_speaker][1] = best_count + 1
+                self.centroids[best_speaker][0] = normalize((best_count * best_centroid + embedding) / (best_count + 1), dim=0)
+                return speaker
             # If no similar speaker found, create a new one
             new_speaker_id = f"SPEAKER {len(self.centroids)}"
             self.centroids[new_speaker_id] = [embedding, 1]
+            return new_speaker_id
 
     def _resample_audio(self, audio):
         if self.framerate != 16_000:
@@ -132,7 +141,7 @@ class SpeakerDiarization:
 
     def recognize(self):
         silence = self._recognize_silence()
-        transcription = None
+        prediction = None
         if not self.vad_state and not silence:
             self.vad_state = True
             self.audio_buffer = self.audio_buffer[-self._get_n_sil_frames():]
@@ -152,12 +161,12 @@ class SpeakerDiarization:
         full_audio_np = np.concatenate(audio_arrays)
         npa = full_audio_np.astype(np.float32) / 32768.0
 
-        # Get embedding and normalize
-        embedding = normalize(torch.from_numpy(self.model({"waveform": torch.from_numpy(
-            npa).unsqueeze(0), "sample_rate": self.framerate})), dim=0).to(self.device)
-        prediction = self._add_embedding(embedding)
 
         if silence:
+            # Get embedding and normalize
+            embedding = normalize(torch.from_numpy(self.model({"waveform": torch.from_numpy(
+                npa).unsqueeze(0), "sample_rate": self.framerate})), dim=0).to(self.device)
+            prediction = self._add_embedding(embedding)
             self.vad_state = False
             self.audio_buffer = []
 
@@ -222,14 +231,7 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
             output_iu.set_speaker(prediction)
             self.current_output.append(output_iu)
             um = retico_core.UpdateMessage()
-            um.add_iu(output_iu, retico_core.UpdateType.ADD)
-
-            if end_of_utterance:
-                for iu in self.current_output:
-                    self.commit(iu)
-                    um.add_iu(iu, retico_core.UpdateType.COMMIT)
-                self.current_output = []
-
+            um.add_iu(output_iu, retico_core.UpdateType.COMMIT)
             self.latest_input_iu = None
             self.append(um)
 
