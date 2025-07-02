@@ -13,16 +13,6 @@ from retico_core.audio import AudioIU
 from retico_core.text import SpeechRecognitionIU
 from torch.nn.functional import normalize
 
-# Buffer for embeddings
-# Every time a buffer is added check which cluster it belongs to
-# If we have no clusters, assign a dummy one
-# After computing 10 embeddings, compute optimal cluster number
-# Compute centroids and reassign labels then commit
-# Each new ten received, add labels based on existing centroids, compute new optimal number, compute new centroids
-# When computing new centroids maintain previous labels
-# Once we receive 100 embeddings, prune, delete embeddings but maintain relevant ones for each centroid, maintain at least 10 embeddings per centroid
-
-
 class SpeakerIU(abstract.IncrementalUnit):
     """An Incremental Unit representing a speaker in the audio stream."""
 
@@ -60,10 +50,10 @@ class SpeakerDiarization:
         max_new_tokens=256,
         use_cache=True,
         similiarity_threshold=0.8,
-        upper_cluster_bound=5,
+        upper_cluster_bound=3,
         max_k_means_iterations=10,
-        max_buffer_size=100,
-        min_buffer_size=10,
+        max_buffer_size=1000,
+        min_buffer_size=8,
     ):
         # Initialize speaker embedding model
         self.device = device
@@ -77,6 +67,7 @@ class SpeakerDiarization:
         self.similiarity_threshold = similiarity_threshold
         self.use_k_means = False
         self.centroids = None
+        self.solo_count = 0
         self.upper_cluster_bound = upper_cluster_bound
         self.max_k_means_iterations = max_k_means_iterations
         self.max_buffer_size = max_buffer_size
@@ -148,21 +139,31 @@ class SpeakerDiarization:
         best_centroids = None
         best_cluster_ids = None
         best_score = -1
+        embeddings = torch.stack(self.embedding_buffer).to(self.device)
         for k in range(2, self.upper_cluster_bound + 1):
+            print(f"{k} clusters with {len(self.embedding_buffer)} embeddings")
             centroids, cluster_ids = self._compute_centroids(k)
             coef.reset()
-            embeddings = torch.stack(self.embedding_buffer).to(self.device)
             coef.update((embeddings, cluster_ids))
             score = coef.compute()
+            print(f"Score for {k} clusters: {score}")
             if best_centroids is None or score > best_score:
                 best_score = score
                 best_centroids = centroids
                 best_cluster_ids = cluster_ids
-        if self.centroids is not None:
-            best_cluster_ids = self._map_cluster_ids(
-                best_centroids, best_cluster_ids)
-        self.centroids = best_centroids
-        return best_cluster_ids
+        # If score is high enough, use new centroids
+        if best_score >= self.similiarity_threshold:
+            if self.centroids is not None:
+                best_cluster_ids = self._map_cluster_ids(
+                    best_centroids, best_cluster_ids)
+            self.centroids = best_centroids
+            return best_cluster_ids
+        # Otherwise, use previous centroids
+        else:
+            centroids = torch.stack(self.centroids).to(self.device)
+            sim = torch.matmul(embeddings, centroids.T)
+            cluster_ids = sim.argmax(dim=1)
+            return cluster_ids
 
     def _prune_embeddings(self):
         # TODO cut down embeddings to size, maintain most important
@@ -171,11 +172,16 @@ class SpeakerDiarization:
 
     def _add_embedding(self, embedding):
         if len(self.embedding_buffer) >= self.max_buffer_size:
-            self.prune_embeddings()
+            self._prune_embeddings()
         self.embedding_buffer.append(embedding)
 
     def _get_speaker_id(self, embedding):
         if self.centroids is None:
+            self.centroids = [embedding]
+            return 0
+        elif len(self.centroids) == 1:
+            self.solo_count = self.solo_count + 1
+            self.centroids = [(self.centroids[0] * embedding / self.solo_count)]
             return 0
         sim = torch.matmul(self.centroids, embedding)
         return sim.argmax().item()
@@ -242,13 +248,6 @@ class SpeakerDiarization:
             npa).unsqueeze(0), "sample_rate": self.framerate})), dim=0).to(self.device)
         self._add_embedding(embedding)
         prediction = self._get_speaker_id(embedding)
-        # Check if we need to use k-means clustering
-        if not self.use_k_means and len(self.embedding_buffer) > 1:
-            embeddings = torch.stack(self.embedding_buffer).to(self.device)
-            sim = (embeddings.sum() - embeddings.diag().sum()) / \
-                (len(embeddings)**2 - len(embeddings))
-            if sim < self.similiarity_threshold:
-                self.use_k_means = True
 
         if silence:
             self.vad_state = False
@@ -286,6 +285,7 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
         )
         self.framerate = framerate
         self.silence_dur = silence_dur
+        self.has_been_silent = False
         self._sd_thread_active = False
         self.latest_input_iu = None
 
@@ -309,6 +309,9 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
             prediction, vad = self.sd.recognize()
             if prediction is None:
                 continue
+            end_of_utterance = not vad
+            if end_of_utterance and not self.has_been_silent:
+                self.sd.use_k_means = True
 
             output_iu = self.create_iu(self.latest_input_iu)
             output_iu.set_speaker(prediction)
@@ -316,9 +319,9 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
             um = retico_core.UpdateMessage()
             um.add_iu(output_iu, retico_core.UpdateType.ADD)
 
-            if len(self.current_output) == self.sd.min_buffer_size:
-                # If we are using k-means, update centroids
-                if self.sd.use_k_means:
+            if end_of_utterance:
+                # If we are using k-means and have enough embeddings, update centroids
+                if self.sd.use_k_means and len(self.sd.embedding_buffer) >= self.sd.min_buffer_size:
                     cluster_ids = self.sd.get_best_centroids()
                     for i, iu in enumerate(self.current_output):
                         speaker_id = cluster_ids[len(
@@ -337,9 +340,11 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
                         else:
                             self.commit(iu)
                             um.add_iu(iu, retico_core.UpdateType.COMMIT)
-                for iu in self.current_output:
-                    self.commit(iu)
-                    um.add_iu(iu, retico_core.UpdateType.COMMIT)
+                else:
+                    for iu in self.current_output:
+                        self.commit(iu)
+                        um.add_iu(iu, retico_core.UpdateType.COMMIT)
+                self.has_been_silent = True
                 self.current_output = []
 
             self.latest_input_iu = None
