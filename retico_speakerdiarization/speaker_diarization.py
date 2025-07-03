@@ -21,10 +21,11 @@ class SpeakerIU(abstract.IncrementalUnit):
         return "Speaker Incremental Unit"
 
     def __init__(self, creator=None, iuid=0, previous_iu=None, grounded_in=None,
-                 payload=None, decision=None, speaker=None, **kwargs):
+                 payload=None, decision=None, speaker=None, embedding=None, **kwargs):
         super().__init__(creator=creator, iuid=iuid, previous_iu=previous_iu,
                          grounded_in=grounded_in, payload=payload, decision=decision, **kwargs)
         self.speaker = speaker
+        self.embedding = embedding
 
     def set_speaker(self, speaker):
         """Set the speaker of the IU.
@@ -34,6 +35,22 @@ class SpeakerIU(abstract.IncrementalUnit):
         """
         self.speaker = speaker
         self.payload = {'speaker': speaker}
+
+    def set_embedding(self, embedding):
+        """Set the embedding of the IU.
+
+        Args:
+            embedding (torch.Tensor): The embedding of the speaker.
+        """
+        self.embedding = embedding
+
+    def get_embedding(self):
+        """Get the embedding of the IU.
+
+        Returns:
+            torch.Tensor: The embedding of the speaker.
+        """
+        return self.embedding
 
     def __repr__(self):
         return f"{self.type()} - {self.creator.name()}: {self.payload['speaker']}"
@@ -47,11 +64,9 @@ class SpeakerDiarization:
         vad_agressiveness=3,
         silence_threshold=0.75,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        max_new_tokens=256,
-        use_cache=True,
         num_speakers=2,
-        similiarity_threshold=0.5,
-        max_buffer_size=1000,
+        sceptical_threshold=0.6,
+        credulous_threshold=0.2,
     ):
         # Initialize speaker embedding model
         self.device = device
@@ -62,9 +77,9 @@ class SpeakerDiarization:
 
         # Speaker embedding related
         self.centroids = dict()
-        self.similiarity_threshold = similiarity_threshold
+        self.sceptical_threshold = sceptical_threshold
+        self.credulous_threshold = credulous_threshold
         self.num_speakers = num_speakers
-        self.max_buffer_size = max_buffer_size
 
         # Audio related
         self.audio_buffer = []
@@ -74,17 +89,11 @@ class SpeakerDiarization:
         self.vad_state = False
         self._n_sil_frames = None
         self.silence_threshold = silence_threshold
-        self.max_new_tokens = max_new_tokens
-        self._temp_audio_array = None
 
-    def _prune_embeddings(self):
-        # TODO cut down embeddings to size, maintain most important
-        pass
-
-    def _add_embedding(self, embedding):
+    def add_embedding(self, embedding):
         if len(self.centroids) == 0:
             self.centroids["SPEAKER 0"] = [embedding, 1]
-            return "SPEAKER 0"
+            return "SPEAKER 0", True
         else:
             best_sim = -1
             best_speaker = None
@@ -95,14 +104,22 @@ class SpeakerDiarization:
                     best_speaker = speaker
             best_centroid = self.centroids[best_speaker][0]
             best_count = self.centroids[best_speaker][1]
-            if best_sim >= self.similiarity_threshold or len(self.centroids) == self.num_speakers:
+            # If the speaker can be strongly confirmed
+            if best_sim >= self.sceptical_threshold:
                 self.centroids[best_speaker][1] = best_count + 1
                 self.centroids[best_speaker][0] = normalize((best_count * best_centroid + embedding) / (best_count + 1), dim=0)
-                return speaker
-            # If no similar speaker found, create a new one
-            new_speaker_id = f"SPEAKER {len(self.centroids)}"
-            self.centroids[new_speaker_id] = [embedding, 1]
-            return new_speaker_id
+                return speaker, True
+            # If the speaker can be weakly confirmed
+            if best_sim >= self.credulous_threshold:
+                return best_speaker, False
+            # If the speaker cannot be confirmed, create a new one, if there is space
+            if len(self.centroids) < self.num_speakers and best_sim < self.credulous_threshold:
+                new_speaker_id = f"SPEAKER {len(self.centroids)}"
+                self.centroids[new_speaker_id] = [embedding, 1]
+                return new_speaker_id, True
+            # Reject the embedding
+            return None, False
+
 
     def _resample_audio(self, audio):
         if self.framerate != 16_000:
@@ -142,19 +159,20 @@ class SpeakerDiarization:
     def recognize(self):
         silence = self._recognize_silence()
         prediction = None
+        embedding = None
         if not self.vad_state and not silence:
             self.vad_state = True
             self.audio_buffer = self.audio_buffer[-self._get_n_sil_frames():]
 
         if not self.vad_state:
-            return None, False
+            return None, False, None
 
         if len(self.audio_buffer) == 0:
-            return None, False
+            return None, False, None
 
         total_length = sum(len(a) for a in self.audio_buffer)
         if total_length < 10:
-            return None, False
+            return None, False, None
 
         audio_arrays = [np.frombuffer(a, dtype=np.int16)
                         for a in self.audio_buffer]
@@ -166,11 +184,11 @@ class SpeakerDiarization:
             # Get embedding and normalize
             embedding = normalize(torch.from_numpy(self.model({"waveform": torch.from_numpy(
                 npa).unsqueeze(0), "sample_rate": self.framerate})), dim=0).to(self.device)
-            prediction = self._add_embedding(embedding)
+            prediction = self.add_embedding(embedding)
             self.vad_state = False
             self.audio_buffer = []
 
-        return prediction, self.vad_state
+        return prediction, self.vad_state, embedding
 
     def reset(self):
         self.vad_state = True
@@ -222,16 +240,36 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
             time.sleep(0.5)
             if not self.framerate:
                 continue
-            prediction, vad = self.sd.recognize()
+            prediction, vad, embedding = self.sd.recognize()
             if prediction is None:
                 continue
+            speaker, confirmed = prediction
             end_of_utterance = not vad
 
             output_iu = self.create_iu(self.latest_input_iu)
             output_iu.set_speaker(prediction)
             self.current_output.append(output_iu)
             um = retico_core.UpdateMessage()
-            um.add_iu(output_iu, retico_core.UpdateType.COMMIT)
+            # If the speaker is confirmed commit the IU, and check all unconfirmed IUs
+            if confirmed:
+                self.commit(output_iu)
+                um.add_iu(output_iu, retico_core.UpdateType.COMMIT)
+                for iu in self.current_output:
+                    if not iu.committed:
+                        speaker, confirmed = self.sd.add_embedding(iu.get_embedding())
+                        new_iu = self.create_iu(iu.grounded_in) if speaker != iu.speaker else iu
+                        if speaker != iu.speaker:
+                            new_iu.set_speaker(speaker)
+                            um.add_iu(iu, retico_core.UpdateType.REVOKE)
+                        if confirmed:
+                            self.commit(new_iu)
+                            um.add_iu(new_iu, retico_core.UpdateType.COMMIT)
+                        elif speaker is not None and speaker != iu.speaker:
+                            um.add_iu(new_iu, retico_core.UpdateType.ADD)
+            # If the speaker is not confirmed, add the IU to the current output
+            else:
+                output_iu.set_embedding(embedding)
+                um.add_iu(output_iu, retico_core.UpdateType.ADD)
             self.latest_input_iu = None
             self.append(um)
 
