@@ -10,16 +10,12 @@ WAVE_OUTPUT_FILENAME = "output.wav"
 
 def record_audio(speaker_name):
     p = pyaudio.PyAudio()
-    stream = p.open(format=FORMAT,
-    channels=CHANNELS,
-    rate=RATE,
-    input=True,
-    frames_per_buffer=CHUNK)
+    stream = p.open(format=FORMAT,channels=CHANNELS,rate=RATE,input=True,frames_per_buffer=CHUNK)
     print("Recording...")
     frames = []
     for i in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
-    data = stream.read(CHUNK)
-    frames.append(data)
+        data = stream.read(CHUNK)
+        frames.append(data)
     print("Recording finished.")
     stream.stop_stream()
     stream.close()
@@ -32,7 +28,7 @@ def record_audio(speaker_name):
     wf.close()
     print(f"Audio saved to {speaker_name}.wav")
 
-num_speakers = int(input("Enter number of speakers"))
+num_speakers = int(input("Enter number of speakers: "))
 for i in range(num_speakers):
-    speaker_name = input(f"Enter name of speaker {i + 1}:")
+    speaker_name = input(f"Enter name of speaker {i + 1}: ")
     record_audio(speaker_name)

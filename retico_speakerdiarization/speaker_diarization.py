@@ -6,13 +6,13 @@ import retico_core
 import threading
 import time
 import torch
+import torchaudio
 import webrtcvad
 
-from ignite.metrics.clustering import SilhouetteScore
-from pyannote.audio import Inference, Model
 from retico_core import abstract
 from retico_core.audio import AudioIU
 from retico_core.text import SpeechRecognitionIU
+from speechbrain.inference.speaker import EncoderClassifier
 from torch.nn.functional import normalize
 
 class SpeakerIU(abstract.IncrementalUnit):
@@ -67,18 +67,17 @@ class SpeakerDiarization:
         silence_threshold=0.75,
         device="cuda" if torch.cuda.is_available() else "cpu",
         num_speakers=2,
-        sceptical_threshold=0.6,
-        credulous_threshold=0.2,
+        sceptical_threshold=0.75,
+        credulous_threshold=0.4,
         # Specify a path to speaker recordings, if you want initial centroids
-        audio_path=None
+        audio_path='audio'
     ):
         # Initialize speaker embedding model
-        self.device = device
-        model_id = "pyannote/embedding"
-        model = Model.from_pretrained(model_id)
-        self.model = Inference(model, window="whole").to(
-            torch.device(self.device))
-
+        self.device = torch.device(device)
+        self.model = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="pretrained_models/spkrec-ecapa")
+        self.model.device = self.device
+        for module in self.model.modules():
+            module.to(self.device)
         # Speaker embedding related
         self.centroids = dict()
         self.sceptical_threshold = sceptical_threshold
@@ -100,8 +99,8 @@ class SpeakerDiarization:
         self.num_speakers = len(audio_files)
         for f in audio_files:
             speaker_name = os.path.splitext(os.path.basename(f))[0]
-            centroids[speaker_name] = normalize(torch.from_numpy(self.model({"waveform": torch.from_numpy(
-                npa).unsqueeze(0), "sample_rate": self.framerate})), dim=0).to(self.device)
+            wav, fs = torchaudio.load(f)
+            self.centroids[speaker_name] = [normalize(self.model.encode_batch(wav).squeeze(0).squeeze(0), dim=0).to(self.device), 1]
 
     def add_embedding(self, embedding):
         if len(self.centroids) == 0:
@@ -191,15 +190,14 @@ class SpeakerDiarization:
                         for a in self.audio_buffer]
         full_audio_np = np.concatenate(audio_arrays)
         npa = full_audio_np.astype(np.float32) / 32768.0
-
-
+        npa = torch.from_numpy(np.clip(npa, -1, 1).astype(np.float32)).to(self.device)
         if silence:
             # Get embedding and normalize
-            embedding = normalize(torch.from_numpy(self.model({"waveform": torch.from_numpy(
-                npa).unsqueeze(0), "sample_rate": self.framerate})), dim=0).to(self.device)
-            prediction = self.add_embedding(embedding)
-            self.vad_state = False
-            self.audio_buffer = []
+            with torch.no_grad():
+                embedding = normalize(self.model.encode_batch(npa.unsqueeze(0)).squeeze(0).squeeze(0), dim=0).to(self.device)
+                prediction = self.add_embedding(embedding)
+                self.vad_state = False
+                self.audio_buffer = []
 
         return prediction, self.vad_state, embedding
 
