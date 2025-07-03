@@ -1,4 +1,6 @@
+import glob
 import numpy as np
+import os
 import pydub
 import retico_core
 import threading
@@ -67,6 +69,8 @@ class SpeakerDiarization:
         num_speakers=2,
         sceptical_threshold=0.6,
         credulous_threshold=0.2,
+        # Specify a path to speaker recordings, if you want initial centroids
+        audio_path=None
     ):
         # Initialize speaker embedding model
         self.device = device
@@ -80,6 +84,7 @@ class SpeakerDiarization:
         self.sceptical_threshold = sceptical_threshold
         self.credulous_threshold = credulous_threshold
         self.num_speakers = num_speakers
+        self.audio_path = audio_path
 
         # Audio related
         self.audio_buffer = []
@@ -89,6 +94,14 @@ class SpeakerDiarization:
         self.vad_state = False
         self._n_sil_frames = None
         self.silence_threshold = silence_threshold
+
+    def get_initial_centroids(self):
+        audio_files = glob.glob(f"{self.audio_path}/*")
+        self.num_speakers = len(audio_files)
+        for f in audio_files:
+            speaker_name = os.path.splitext(os.path.basename(f))[0]
+            centroids[speaker_name] = normalize(torch.from_numpy(self.model({"waveform": torch.from_numpy(
+                npa).unsqueeze(0), "sample_rate": self.framerate})), dim=0).to(self.device)
 
     def add_embedding(self, embedding):
         if len(self.centroids) == 0:
@@ -274,6 +287,8 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
             self.append(um)
 
     def prepare_run(self):
+        if self.sd.audio_path is not None:
+            self.sd.get_initial_centroids()
         self._sd_thread_active = True
         # Make thread daemon for cleaner shutdown
         threading.Thread(target=self._sd_thread, daemon=True).start()
