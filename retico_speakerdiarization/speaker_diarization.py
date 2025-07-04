@@ -15,6 +15,7 @@ from retico_core.text import SpeechRecognitionIU
 from speechbrain.inference.speaker import EncoderClassifier
 from torch.nn.functional import normalize
 
+
 class SpeakerIU(abstract.IncrementalUnit):
     """An Incremental Unit representing a speaker in the audio stream."""
 
@@ -66,15 +67,17 @@ class SpeakerDiarization:
         vad_agressiveness=3,
         silence_threshold=0.75,
         device="cuda" if torch.cuda.is_available() else "cpu",
+        # Overwritten if providing initial samples
         num_speakers=2,
         sceptical_threshold=0.75,
         credulous_threshold=0.4,
         # Specify a path to speaker recordings, if you want initial centroids
-        audio_path='audio'
+        audio_path=None
     ):
         # Initialize speaker embedding model
         self.device = torch.device(device)
-        self.model = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="pretrained_models/spkrec-ecapa")
+        self.model = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb", savedir="pretrained_models/spkrec-ecapa")
         self.model.device = self.device
         for module in self.model.modules():
             module.to(self.device)
@@ -100,7 +103,8 @@ class SpeakerDiarization:
         for f in audio_files:
             speaker_name = os.path.splitext(os.path.basename(f))[0]
             wav, fs = torchaudio.load(f)
-            self.centroids[speaker_name] = [normalize(self.model.encode_batch(wav).squeeze(0).squeeze(0), dim=0).to(self.device), 1]
+            self.centroids[speaker_name] = [normalize(self.model.encode_batch(
+                wav).squeeze(0).squeeze(0), dim=0).to(self.device), 1]
 
     def add_embedding(self, embedding):
         if len(self.centroids) == 0:
@@ -119,7 +123,8 @@ class SpeakerDiarization:
             # If the speaker can be strongly confirmed
             if best_sim >= self.sceptical_threshold:
                 self.centroids[best_speaker][1] = best_count + 1
-                self.centroids[best_speaker][0] = normalize((best_count * best_centroid + embedding) / (best_count + 1), dim=0)
+                self.centroids[best_speaker][0] = normalize(
+                    (best_count * best_centroid + embedding) / (best_count + 1), dim=0)
                 return speaker, True
             # If the speaker can be weakly confirmed
             if best_sim >= self.credulous_threshold:
@@ -131,7 +136,6 @@ class SpeakerDiarization:
                 return new_speaker_id, True
             # Reject the embedding
             return None, False
-
 
     def _resample_audio(self, audio):
         if self.framerate != 16_000:
@@ -190,11 +194,13 @@ class SpeakerDiarization:
                         for a in self.audio_buffer]
         full_audio_np = np.concatenate(audio_arrays)
         npa = full_audio_np.astype(np.float32) / 32768.0
-        npa = torch.from_numpy(np.clip(npa, -1, 1).astype(np.float32)).to(self.device)
+        npa = torch.from_numpy(
+            np.clip(npa, -1, 1).astype(np.float32)).to(self.device)
         if silence:
             # Get embedding and normalize
             with torch.no_grad():
-                embedding = normalize(self.model.encode_batch(npa.unsqueeze(0)).squeeze(0).squeeze(0), dim=0).to(self.device)
+                embedding = normalize(self.model.encode_batch(
+                    npa.unsqueeze(0)).squeeze(0).squeeze(0), dim=0).to(self.device)
                 prediction = self.add_embedding(embedding)
                 self.vad_state = False
                 self.audio_buffer = []
@@ -223,11 +229,21 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
     def output_iu():
         return SpeakerIU
 
-    def __init__(self, framerate=None, silence_dur=1, **kwargs):
+    def __init__(self, framerate=None, silence_dur=1,
+                 # Overwritten if providing initial samples
+                 num_speakers=2,
+                 sceptical_threshold=0.75,
+                 credulous_threshold=0.4,
+                 # Specify a path to speaker recordings, if you want initial centroids
+                 audio_path=None, **kwargs):
         super().__init__(**kwargs)
 
         self.sd = SpeakerDiarization(
             silence_dur=silence_dur,
+            num_speakers=num_speakers,
+            sceptical_threshold=sceptical_threshold,
+            credulous_threshold=credulous_threshold,
+            audio_path=audio_path
         )
         self.framerate = framerate
         self.silence_dur = silence_dur
@@ -267,8 +283,10 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
                 um.add_iu(output_iu, retico_core.UpdateType.COMMIT)
                 for iu in self.current_output:
                     if not iu.committed:
-                        speaker, confirmed = self.sd.add_embedding(iu.get_embedding())
-                        new_iu = self.create_iu(iu.grounded_in) if speaker != iu.speaker else iu
+                        speaker, confirmed = self.sd.add_embedding(
+                            iu.get_embedding())
+                        new_iu = self.create_iu(
+                            iu.grounded_in) if speaker != iu.speaker else iu
                         if speaker != iu.speaker:
                             new_iu.set_speaker(speaker)
                             um.add_iu(iu, retico_core.UpdateType.REVOKE)
