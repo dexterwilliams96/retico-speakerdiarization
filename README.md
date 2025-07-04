@@ -28,6 +28,11 @@ Whenever, a new embedding is committed the centroids are updated. When this happ
 
 Normally the module starts with no centroids. This can be irritating, as if the microphone picks up background noise when there are speaker slots left it will make that embedding a centroid. As an alternative you can specify `audio_path` to point to a directory containing audio files. These audio files should be named after each speaker. These are then processed at startup. The initial embeddings will become the initial centroids, and the speaker IDs will be derived from the filenames. A utility script for recording 10 second clips of audio is included for convenience.
 
+You will need a backend to support `torchaudio.io` if you are loading initial wav files:
+```
+conda install -c conda-forge 'ffmpeg<7'
+```
+
 ### Interpreting output IUs
 
 When setting credulous/sceptical thresholds consider the following
