@@ -12,7 +12,7 @@ import webrtcvad
 from retico_core import abstract
 from retico_core.audio import AudioIU
 from retico_core.text import SpeechRecognitionIU
-from speechbrain.inference.speaker import EncoderClassifier
+from speechbrain.inference.speaker import SpeakerRecognition
 from torch.nn.functional import normalize
 
 
@@ -30,14 +30,26 @@ class SpeakerIU(abstract.IncrementalUnit):
         self.speaker = speaker
         self.embedding = embedding
 
+    def get_speaker(self):
+        return self.speaker
+
     def set_speaker(self, speaker):
         """Set the speaker of the IU.
 
         Args:
-            speaker (int): The ID of the speaker.
+            speaker: Tuple, with first index as speaker name (or None if can't be matched)
+                     and second index as boolean representing confirmation/commit.
         """
         self.speaker = speaker
         self.payload = {'speaker': speaker}
+
+    def get_embedding(self):
+        """Get the embedding of the IU.
+
+        Returns:
+            torch.Tensor: The embedding of the speaker.
+        """
+        return self.embedding
 
     def set_embedding(self, embedding):
         """Set the embedding of the IU.
@@ -47,13 +59,6 @@ class SpeakerIU(abstract.IncrementalUnit):
         """
         self.embedding = embedding
 
-    def get_embedding(self):
-        """Get the embedding of the IU.
-
-        Returns:
-            torch.Tensor: The embedding of the speaker.
-        """
-        return self.embedding
 
     def __repr__(self):
         return f"{self.type()} - {self.creator.name()}: {self.payload['speaker']}"
@@ -76,7 +81,7 @@ class SpeakerDiarization:
     ):
         # Initialize speaker embedding model
         self.device = torch.device(device)
-        self.model = EncoderClassifier.from_hparams(
+        self.model = SpeakerRecognition.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb", savedir="pretrained_models/spkrec-ecapa")
         self.model.device = self.device
         for module in self.model.modules():
@@ -135,7 +140,7 @@ class SpeakerDiarization:
                 self.centroids[new_speaker_id] = [embedding, 1]
                 return new_speaker_id, True
             # Reject the embedding
-            return None, False
+            return None, True
 
     def _resample_audio(self, audio):
         if self.framerate != 16_000:
@@ -275,30 +280,35 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
 
             output_iu = self.create_iu(self.latest_input_iu)
             output_iu.set_speaker(prediction)
-            self.current_output.append(output_iu)
             um = retico_core.UpdateMessage()
             # If the speaker is confirmed commit the IU, and check all unconfirmed IUs
+            remove_set = []
             if confirmed:
-                self.commit(output_iu)
                 um.add_iu(output_iu, retico_core.UpdateType.COMMIT)
+                remove_set.append(output_iu)
                 for iu in self.current_output:
                     if not iu.committed:
-                        speaker, confirmed = self.sd.add_embedding(
+                        prediction = self.sd.add_embedding(
                             iu.get_embedding())
+                        speaker, confirmed = prediction
                         new_iu = self.create_iu(
-                            iu.grounded_in) if speaker != iu.speaker else iu
-                        if speaker != iu.speaker:
-                            new_iu.set_speaker(speaker)
-                            um.add_iu(iu, retico_core.UpdateType.REVOKE)
+                            iu.grounded_in) if speaker != iu.speaker[0] else iu
                         if confirmed:
-                            self.commit(new_iu)
                             um.add_iu(new_iu, retico_core.UpdateType.COMMIT)
-                        elif speaker is not None and speaker != iu.speaker:
+                            remove_set.append(new_iu)
+                        elif speaker != iu.speaker[0]:
+                            new_iu.set_speaker(prediction)
+                            um.add_iu(iu, retico_core.UpdateType.REVOKE)
+                            remove_set.append(iu)
+                            new_iu.set_embedding(iu.get_embedding())
                             um.add_iu(new_iu, retico_core.UpdateType.ADD)
+                            self.current_output.append(new_iu)
             # If the speaker is not confirmed, add the IU to the current output
             else:
                 output_iu.set_embedding(embedding)
+                self.current_output.append(output_iu)
                 um.add_iu(output_iu, retico_core.UpdateType.ADD)
+            self.current_output = [iu for iu in self.current_output if iu not in remove_set]
             self.latest_input_iu = None
             self.append(um)
 

@@ -67,4 +67,7 @@ input('Press enter to ...')
 debug.stop()
 sd.stop()
 mic.stop()
+
 ```
+### Utterance module
+Also included for convenience is an utterance module. This module takes in ASR and speaker incremental units, and matches them based on their timestamps. It then outputs an utterance incremental unit which contains the text and speaker for an entire utterance (an utterance ends when there is silence).
