@@ -78,6 +78,8 @@ class UtteranceModule(retico_core.AbstractModule):
                     output_iu, retico_core.UpdateType.ADD)
                 self.current_output.append(output_iu)
 
+    def _closer_to(self, utter_time, time1, time2):
+        return abs(utter_time - time1) > abs(utter_time - time2)
 
     def _update_existing_ius(self, um, speakers_updated, old_last_speaker):
         new_last_speaker = self.speaker_timeline.keys()[
@@ -89,14 +91,11 @@ class UtteranceModule(retico_core.AbstractModule):
             origin = iu.grounded_in.grounded_in.created_at
             # If this was an unconfirmed last speaker and the last speaker changed, recheck
             if self.last_text is not None and origin == old_last_speaker and new_last_speaker != old_last_speaker:
-                next_key = new_last_speaker
-                next_dist = next_key - self.last_text
-                prev_dist = self.last_text - old_last_speaker
-                if next_dist < prev_dist:
+                if self._closer_to(utt_key, old_last_speaker, new_last_speaker):
                     self.last_text = None
                     um.add_iu(iu, retico_core.UpdateType.REVOKE)
                     remove_set.append(iu)
-                    speaker = self.speaker_timeline[next_key]
+                    speaker = self.speaker_timeline[new_last_speaker]
                     self._add_new_utterance(um, speaker, iu.get_text())
                     # Will be revoked, don't do additional checks
                     continue
@@ -124,10 +123,9 @@ class UtteranceModule(retico_core.AbstractModule):
     def _create_new_utterances(self, um):
         # Map utterances to their closest speaker to get new IUs
         delete_utterance = []
-        for utt_key in self.utterances.keys():
+        for utt_key, utterance in self.utterances.items():
             speaker_keys = self.speaker_timeline.keys()
             for i, speaker_key in enumerate(speaker_keys):
-                utterance = self.utterances[utt_key]
                 speaker = self.speaker_timeline[speaker_key]
                 # Anything before first speaker is first speaker
                 if i == 0 and utt_key <= speaker_key:
@@ -149,10 +147,7 @@ class UtteranceModule(retico_core.AbstractModule):
                 # Otherwise check if closer to current or next speaker
                 elif i != 0 and utt_key >= speaker_key and utt_key <= speaker_keys[i + 1]:
                     # Check which speaker the utterance is closer to by comparing the grounded audio input
-                    prev_dist = utt_key - speaker_key
-                    next_key = speaker_keys[i + 1]
-                    next_dist = next_key - utt_key
-                    if next_dist < prev_dist:
+                    if self._closer_to(utt_key, speaker_key, speaker_keys[i + 1]):
                         speaker = self.speaker_timeline[next_key]
                     delete_utterance.append(utt_key)
                     self._add_new_utterance(um, speaker, utterance)
