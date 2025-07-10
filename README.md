@@ -10,6 +10,14 @@ pip install .
 ```
 You will likely want `cuBLAS` and `cuDNN` for GPU execution (see [here](https://pytorch.org/get-started/locally/)).
 
+If you run into issues importing speechbrain:
+```bash
+git clone https://github.com/speechbrain/speechbrain.git
+cd speechbrain
+pip install -r requirements.txt
+pip install --editable .
+```
+
 ### Loading Initial Embeddings
 
 The module requires an audio recording of each speaker. This is then used to generate some synthetic data for each speaker for a classifier.
