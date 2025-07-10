@@ -113,11 +113,13 @@ class UtteranceModule(retico_core.AbstractModule):
                     um.add_iu(iu, retico_core.UpdateType.REVOKE)
                     remove_set.append(iu)
                 # If speaker confirmed and not unknown commit the IU
-                if new_speaker[0] is not None and new_speaker[1]:
+                if new_speaker[1]:
                     um.add_iu(new_iu, retico_core.UpdateType.COMMIT)
                     remove_set.append(new_iu)
                 # If the speaker id is uncomfirmed but known then add the IU
-                elif new_speaker[0] is not None and not new_speaker[1]:
+                elif not new_speaker[1]:
+                    new_iu.set(speaker)
+                    new_iu.set_text(iu)
                     um.add_iu(new_iu, retico_core.UpdateType.ADD)
                     add_set.append(new_iu)
         self.current_output = [

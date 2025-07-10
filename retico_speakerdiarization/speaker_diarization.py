@@ -144,7 +144,7 @@ class SpeakerDiarization:
         self.speaker_map[self.speaker_1_name] = 0.9
         self.speaker_map[self.speaker_2_name] = 0.1
 
-    def _generate_synthetic_data(self, embedding, label, num_samples=20, noise_std=0.01):
+    def _generate_synthetic_data(self, embedding, label, num_samples=20, noise_std=0.03):
         data = []
         emb = embedding.unsqueeze(0)
         for _ in range(num_samples):
@@ -164,8 +164,9 @@ class SpeakerDiarization:
                 sim_2 = F.cosine_similarity(emb, self.speaker_2_embedding)
                 input_vec = torch.tensor(
                     [[sim_1.item(), sim_2.item()]]).to(self.device)
+                input_vec = (input_vec - input_vec.mean()) / input_vec.std()
                 output = self.classifier(input_vec)
-                target = torch.tensor([[label]], dtype=torch.float32).to(self.device)
+                target = torch.tensor([[label * 0.9 + 0.05]], dtype=torch.float32).to(self.device)
                 loss = self.loss_fn(output, target)
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -177,11 +178,13 @@ class SpeakerDiarization:
         sim_1 = F.cosine_similarity(embedding, self.speaker_1_embedding, dim=0)
         sim_2 = F.cosine_similarity(embedding, self.speaker_2_embedding, dim=0)
         input_vec = torch.tensor([[sim_1.item(), sim_2.item()]]).to(self.device)
+        input_vec = (input_vec - input_vec.mean()) / input_vec.std()
         prob_1 = self.classifier(input_vec).item()
         return self.speaker_1_name if prob_1 >= 0.5 else self.speaker_2_name, 1.0 - prob_1
 
     def add_embedding(self, embedding):
         label, confidence = self._classify_embedding(embedding)
+
         # If the speaker can be strongly confirmed
         if confidence >= self.sceptical_threshold:
             if label == self.speaker_1_name:
@@ -337,24 +340,22 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
             remove_set = []
             if confirmed:
                 um.add_iu(output_iu, retico_core.UpdateType.COMMIT)
-                remove_set.append(output_iu)
                 for iu in self.current_output:
-                    if not iu.committed:
-                        prediction = self.sd.add_embedding(
-                            iu.get_embedding())
-                        speaker, confirmed = prediction
-                        new_iu = self.create_iu(
-                            iu.grounded_in) if speaker != iu.speaker[0] else iu
-                        if confirmed:
-                            um.add_iu(new_iu, retico_core.UpdateType.COMMIT)
-                            remove_set.append(new_iu)
-                        elif speaker != iu.speaker[0]:
-                            new_iu.set_speaker(prediction)
-                            um.add_iu(iu, retico_core.UpdateType.REVOKE)
-                            remove_set.append(iu)
-                            new_iu.set_embedding(iu.get_embedding())
-                            um.add_iu(new_iu, retico_core.UpdateType.ADD)
-                            self.current_output.append(new_iu)
+                    prediction = self.sd.add_embedding(
+                        iu.get_embedding())
+                    speaker, confirmed = prediction
+                    new_iu = self.create_iu(
+                        iu.grounded_in) if speaker != iu.speaker[0] else iu
+                    if confirmed:
+                        um.add_iu(new_iu, retico_core.UpdateType.COMMIT)
+                        remove_set.append(new_iu)
+                    elif speaker != iu.speaker[0]:
+                        new_iu.set_speaker(prediction)
+                        um.add_iu(iu, retico_core.UpdateType.REVOKE)
+                        remove_set.append(iu)
+                        new_iu.set_embedding(iu.get_embedding())
+                        um.add_iu(new_iu, retico_core.UpdateType.ADD)
+                        self.current_output.append(new_iu)
             # If the speaker is not confirmed, add the IU to the current output
             else:
                 output_iu.set_embedding(embedding)
