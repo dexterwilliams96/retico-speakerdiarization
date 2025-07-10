@@ -71,21 +71,24 @@ class SpeakerDiarization:
         silence_dur=1,
         vad_agressiveness=3,
         silence_threshold=0.75,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device="cpu",
         # Overwritten if providing initial samples
         num_speakers=2,
         sceptical_threshold=0.75,
         credulous_threshold=0.4,
         # Specify a path to speaker recordings, if you want initial centroids
-        audio_path=None
+        audio_path=None,
+        compile_model=True
     ):
         # Initialize speaker embedding model
         self.device = torch.device(device)
         self.model = SpeakerRecognition.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb", savedir="pretrained_models/spkrec-ecapa")
-        self.model.device = self.device
+        self.model.device = device
         for module in self.model.modules():
-            module.to(self.device)
+            module.to(device)
+        if compile_model:
+            self.model = torch.compile(self.model)
         # Speaker embedding related
         self.centroids = dict()
         self.sceptical_threshold = sceptical_threshold
@@ -105,11 +108,12 @@ class SpeakerDiarization:
     def get_initial_centroids(self):
         audio_files = glob.glob(f"{self.audio_path}/*")
         self.num_speakers = len(audio_files)
-        for f in audio_files:
-            speaker_name = os.path.splitext(os.path.basename(f))[0]
-            wav, fs = torchaudio.load(f)
-            self.centroids[speaker_name] = [normalize(self.model.encode_batch(
-                wav).squeeze(0).squeeze(0), dim=0).to(self.device), 1]
+        with torch.no_grad():
+            for f in audio_files:
+                speaker_name = os.path.splitext(os.path.basename(f))[0]
+                wav, fs = torchaudio.load(f)
+                self.centroids[speaker_name] = [normalize(self.model.encode_batch(
+                    wav).squeeze(0).squeeze(0), dim=0).to(self.device), 1]
 
     def add_embedding(self, embedding):
         if len(self.centroids) == 0:
@@ -240,7 +244,9 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
                  sceptical_threshold=0.75,
                  credulous_threshold=0.4,
                  # Specify a path to speaker recordings, if you want initial centroids
-                 audio_path=None, **kwargs):
+                 audio_path=None,
+                 device="cuda" if torch.cuda.is_available() else "cpu",
+                 **kwargs):
         super().__init__(**kwargs)
 
         self.sd = SpeakerDiarization(
@@ -248,7 +254,8 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
             num_speakers=num_speakers,
             sceptical_threshold=sceptical_threshold,
             credulous_threshold=credulous_threshold,
-            audio_path=audio_path
+            audio_path=audio_path,
+            device=device
         )
         self.framerate = framerate
         self.silence_dur = silence_dur

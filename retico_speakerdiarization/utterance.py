@@ -1,7 +1,7 @@
 import retico_core
 
 from retico_core.text import SpeechRecognitionIU
-from retico_speakerdiarization.speaker_diarization import SpeakerIU
+from retico_speakerdiarization import SpeakerIU
 from sortedcontainers import SortedDict
 
 
@@ -35,6 +35,9 @@ class UtteranceIU(retico_core.IncrementalUnit):
         self.text = text
         self.payload["text"] = self.text
 
+    def __repr__(self):
+        return f"Speaker {self.speaker}, Text: {self.text}"
+
 
 class UtteranceModule(retico_core.AbstractModule):
     @staticmethod
@@ -64,7 +67,9 @@ class UtteranceModule(retico_core.AbstractModule):
         # Whether consective utterances from the same speaker should be merged
         self.merge_utterances = merge_utterances
 
-    def _add_new_utterance(self, um, speaker, text):
+    def _add_new_utterance(self, um, speaker, text, add_set=None):
+        if add_set == None:
+            add_set = self.current_output
         speaker_id, confirmed = speaker.get_speaker()
         if speaker_id is not None:
             output_iu = self.create_iu(speaker)
@@ -76,7 +81,7 @@ class UtteranceModule(retico_core.AbstractModule):
             else:
                 um.add_iu(
                     output_iu, retico_core.UpdateType.ADD)
-                self.current_output.append(output_iu)
+                add_set.append(output_iu)
 
     def _closer_to(self, utter_time, time1, time2):
         return abs(utter_time - time1) > abs(utter_time - time2)
@@ -86,17 +91,18 @@ class UtteranceModule(retico_core.AbstractModule):
             len(self.speaker_timeline) - 1]
         # Update existing IUs
         remove_set = []
+        add_set = []
         for iu in self.current_output:
             # Check the original audio in timestamp for the speaker id
             origin = iu.grounded_in.grounded_in.created_at
             # If this was an unconfirmed last speaker and the last speaker changed, recheck
             if self.last_text is not None and origin == old_last_speaker and new_last_speaker != old_last_speaker:
-                if self._closer_to(utt_key, old_last_speaker, new_last_speaker):
+                if self._closer_to(self.last_text, old_last_speaker, new_last_speaker):
                     self.last_text = None
                     um.add_iu(iu, retico_core.UpdateType.REVOKE)
                     remove_set.append(iu)
                     speaker = self.speaker_timeline[new_last_speaker]
-                    self._add_new_utterance(um, speaker, iu.get_text())
+                    self._add_new_utterance(um, speaker, iu.get_text(), add_set)
                     # Will be revoked, don't do additional checks
                     continue
             # Otherwise if speaker changed
@@ -115,10 +121,10 @@ class UtteranceModule(retico_core.AbstractModule):
                 # If the speaker id is uncomfirmed but known then add the IU
                 elif new_speaker[0] is not None and not new_speaker[1]:
                     um.add_iu(new_iu, retico_core.UpdateType.ADD)
-                    self.current_output.append(new_iu)
-
+                    add_set.append(new_iu)
         self.current_output = [
             iu for iu in self.current_output if iu not in remove_set]
+        self.current_output = self.current_output + add_set
 
     def _create_new_utterances(self, um):
         # Map utterances to their closest speaker to get new IUs
@@ -148,7 +154,7 @@ class UtteranceModule(retico_core.AbstractModule):
                 elif i != 0 and utt_key >= speaker_key and utt_key <= speaker_keys[i + 1]:
                     # Check which speaker the utterance is closer to by comparing the grounded audio input
                     if self._closer_to(utt_key, speaker_key, speaker_keys[i + 1]):
-                        speaker = self.speaker_timeline[next_key]
+                        speaker = self.speaker_timeline[speaker_keys[i + 1]]
                     delete_utterance.append(utt_key)
                     self._add_new_utterance(um, speaker, utterance)
 
