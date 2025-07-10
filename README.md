@@ -5,7 +5,7 @@ Incremental speech diarization module for [ReTiCo](https://github.com/retico-tea
 ### Requirements
 
 This module was built using `python=3.9`, install with pip:
-```
+```bash
 pip install .
 ```
 You will likely want `cuBLAS` and `cuDNN` for GPU execution (see [here](https://pytorch.org/get-started/locally/)).
@@ -23,7 +23,7 @@ pip install --editable .
 The module requires an audio recording of each speaker. This is then used to generate some synthetic data for each speaker for a classifier.
 
 You will need a backend to support `torchaudio.io` if you are loading initial wav files:
-```
+```bash
 conda install -c conda-forge 'ffmpeg<7'
 ```
 ### Explanation
@@ -46,7 +46,7 @@ When setting credulous/sceptical thresholds consider the following
 - SpeakerIUs that are added are quite likely to guarantee the speaker ID, but not enough that they should train the model, they can later be REVOKED
 
 ### Example
-```
+```python
 import retico_core
 from retico_core import *
 from retico_core.text import SpeechRecognitionIU
