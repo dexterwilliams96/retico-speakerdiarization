@@ -2,10 +2,13 @@ import glob
 import numpy as np
 import os
 import pydub
+import random
 import retico_core
 import threading
 import time
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torchaudio
 import webrtcvad
 
@@ -13,7 +16,6 @@ from retico_core import abstract
 from retico_core.audio import AudioIU
 from retico_core.text import SpeechRecognitionIU
 from speechbrain.inference.speaker import SpeakerRecognition
-from torch.nn.functional import normalize
 
 
 class SpeakerIU(abstract.IncrementalUnit):
@@ -59,9 +61,17 @@ class SpeakerIU(abstract.IncrementalUnit):
         """
         self.embedding = embedding
 
-
     def __repr__(self):
         return f"{self.type()} - {self.creator.name()}: {self.payload['speaker']}"
+
+
+class CosineSimClassifier(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(2, 1)
+
+    def forward(self, x):
+        return torch.sigmoid(self.linear(x))
 
 
 class SpeakerDiarization:
@@ -72,12 +82,9 @@ class SpeakerDiarization:
         vad_agressiveness=3,
         silence_threshold=0.75,
         device="cpu",
-        # Overwritten if providing initial samples
-        num_speakers=2,
-        sceptical_threshold=0.75,
-        credulous_threshold=0.4,
-        # Specify a path to speaker recordings, if you want initial centroids
-        audio_path=None,
+        sceptical_threshold=0.4,
+        train_buffer_size=1,
+        audio_path='audio',
         compile_model=True
     ):
         # Initialize speaker embedding model
@@ -89,11 +96,17 @@ class SpeakerDiarization:
             module.to(device)
         if compile_model:
             self.model = torch.compile(self.model)
+        self.classifier = CosineSimClassifier().to(device)
+        self.optimizer = torch.optim.SGD(self.classifier.parameters(), lr=0.1, weight_decay=1e-4)
+        self.loss_fn = nn.BCELoss()
+
         # Speaker embedding related
-        self.centroids = dict()
+        self.speaker_1_embedding = None
+        self.speaker_2_embedding = None
+        self.speaker_1_name = None
+        self.speaker_2_name = None
+        self.speaker_map = dict()
         self.sceptical_threshold = sceptical_threshold
-        self.credulous_threshold = credulous_threshold
-        self.num_speakers = num_speakers
         self.audio_path = audio_path
 
         # Audio related
@@ -105,46 +118,83 @@ class SpeakerDiarization:
         self._n_sil_frames = None
         self.silence_threshold = silence_threshold
 
-    def get_initial_centroids(self):
+        # Setup
+        self.train_buffer_size = train_buffer_size
+        self._get_initial_centroids()
+        self.data_s1 = self._generate_synthetic_data(
+            self.speaker_1_embedding, self.speaker_1_name)
+        self.data_s2 = self._generate_synthetic_data(
+            self.speaker_2_embedding, self.speaker_2_name)
+        self._train_classifier()
+
+    def _get_initial_centroids(self):
+        # Should be two of these
         audio_files = glob.glob(f"{self.audio_path}/*")
-        self.num_speakers = len(audio_files)
         with torch.no_grad():
-            for f in audio_files:
-                speaker_name = os.path.splitext(os.path.basename(f))[0]
-                wav, fs = torchaudio.load(f)
-                self.centroids[speaker_name] = [normalize(self.model.encode_batch(
-                    wav).squeeze(0).squeeze(0), dim=0).to(self.device), 1]
+            self.speaker_1_name = os.path.splitext(
+                os.path.basename(audio_files[0]))[0]
+            wav, fs = torchaudio.load(audio_files[0])
+            self.speaker_1_embedding = F.normalize(self.model.encode_batch(
+                wav).squeeze(0).squeeze(0), dim=0).to(self.device)
+            self.speaker_2_name = os.path.splitext(
+                os.path.basename(audio_files[1]))[0]
+            wav, fs = torchaudio.load(audio_files[1])
+            self.speaker_2_embedding = F.normalize(self.model.encode_batch(
+                wav).squeeze(0).squeeze(0), dim=0).to(self.device)
+        self.speaker_map[self.speaker_1_name] = 0.9
+        self.speaker_map[self.speaker_2_name] = 0.1
+
+    def _generate_synthetic_data(self, embedding, label, num_samples=20, noise_std=0.01):
+        data = []
+        emb = embedding.unsqueeze(0)
+        for _ in range(num_samples):
+            noisy = F.normalize(emb + torch.randn_like(emb)
+                                * noise_std, dim=1).to(self.device)
+            data.append((noisy, torch.tensor(
+                [self.speaker_map[label]], dtype=torch.float32).to(self.device)))
+        return data
+
+    def _train_classifier(self, epochs=50, sample_size=10):
+        for _ in range(epochs):
+            batch = random.sample(self.data_s1, sample_size) + \
+                random.sample(self.data_s2, sample_size)
+            random.shuffle(batch)
+            for emb, label in batch:
+                sim_1 = F.cosine_similarity(emb, self.speaker_1_embedding)
+                sim_2 = F.cosine_similarity(emb, self.speaker_2_embedding)
+                input_vec = torch.tensor(
+                    [[sim_1.item(), sim_2.item()]]).to(self.device)
+                output = self.classifier(input_vec)
+                target = torch.tensor([[label]], dtype=torch.float32).to(self.device)
+                loss = self.loss_fn(output, target)
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+        self.data_s1 = []
+        self.data_s2 = []
+
+    def _classify_embedding(self, embedding):
+        sim_1 = F.cosine_similarity(embedding, self.speaker_1_embedding, dim=0)
+        sim_2 = F.cosine_similarity(embedding, self.speaker_2_embedding, dim=0)
+        input_vec = torch.tensor([[sim_1.item(), sim_2.item()]]).to(self.device)
+        prob_1 = self.classifier(input_vec).item()
+        return self.speaker_1_name if prob_1 >= 0.5 else self.speaker_2_name, 1.0 - prob_1
 
     def add_embedding(self, embedding):
-        if len(self.centroids) == 0:
-            self.centroids["SPEAKER 0"] = [embedding, 1]
-            return "SPEAKER 0", True
-        else:
-            best_sim = -1
-            best_speaker = None
-            for speaker, (centroid, count) in self.centroids.items():
-                sim = torch.cosine_similarity(embedding, centroid, dim=0)
-                if sim > best_sim:
-                    best_sim = sim
-                    best_speaker = speaker
-            best_centroid = self.centroids[best_speaker][0]
-            best_count = self.centroids[best_speaker][1]
-            # If the speaker can be strongly confirmed
-            if best_sim >= self.sceptical_threshold:
-                self.centroids[best_speaker][1] = best_count + 1
-                self.centroids[best_speaker][0] = normalize(
-                    (best_count * best_centroid + embedding) / (best_count + 1), dim=0)
-                return speaker, True
-            # If the speaker can be weakly confirmed
-            if best_sim >= self.credulous_threshold:
-                return best_speaker, False
-            # If the speaker cannot be confirmed, create a new one, if there is space
-            if len(self.centroids) < self.num_speakers and best_sim < self.credulous_threshold:
-                new_speaker_id = f"SPEAKER {len(self.centroids)}"
-                self.centroids[new_speaker_id] = [embedding, 1]
-                return new_speaker_id, True
-            # Reject the embedding
-            return None, True
+        label, confidence = self._classify_embedding(embedding)
+        # If the speaker can be strongly confirmed
+        if confidence >= self.sceptical_threshold:
+            if label == self.speaker_1_name:
+                self.data_s1.append(
+                    (embedding, torch.tensor([self.speaker_map[label]], dtype=torch.float32)))
+            else:
+                self.data_s2.append(
+                    (embedding, torch.tensor([self.speaker_map[label]], dtype=torch.float32)))
+            if len(self.data_s1) == self.train_buffer_size and len(self.data_s2) == self.train_buffer_size:
+                self._train_classifier(epochs=1, sample_size=self.train_buffer_size)
+            return label, True
+        # Weak confirmation
+        return label, False
 
     def _resample_audio(self, audio):
         if self.framerate != 16_000:
@@ -206,9 +256,9 @@ class SpeakerDiarization:
         npa = torch.from_numpy(
             np.clip(npa, -1, 1).astype(np.float32)).to(self.device)
         if silence:
-            # Get embedding and normalize
+            # Get embedding and F.normalize
             with torch.no_grad():
-                embedding = normalize(self.model.encode_batch(
+                embedding = F.normalize(self.model.encode_batch(
                     npa.unsqueeze(0)).squeeze(0).squeeze(0), dim=0).to(self.device)
                 prediction = self.add_embedding(embedding)
                 self.vad_state = False
@@ -239,21 +289,16 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
         return SpeakerIU
 
     def __init__(self, framerate=None, silence_dur=1,
-                 # Overwritten if providing initial samples
-                 num_speakers=2,
-                 sceptical_threshold=0.75,
-                 credulous_threshold=0.4,
+                 sceptical_threshold=0.4,
                  # Specify a path to speaker recordings, if you want initial centroids
-                 audio_path=None,
+                 audio_path='audio',
                  device="cuda" if torch.cuda.is_available() else "cpu",
                  **kwargs):
         super().__init__(**kwargs)
 
         self.sd = SpeakerDiarization(
             silence_dur=silence_dur,
-            num_speakers=num_speakers,
             sceptical_threshold=sceptical_threshold,
-            credulous_threshold=credulous_threshold,
             audio_path=audio_path,
             device=device
         )
@@ -315,13 +360,12 @@ class SpeakerDiarizationModule(retico_core.AbstractModule):
                 output_iu.set_embedding(embedding)
                 self.current_output.append(output_iu)
                 um.add_iu(output_iu, retico_core.UpdateType.ADD)
-            self.current_output = [iu for iu in self.current_output if iu not in remove_set]
+            self.current_output = [
+                iu for iu in self.current_output if iu not in remove_set]
             self.latest_input_iu = None
             self.append(um)
 
     def prepare_run(self):
-        if self.sd.audio_path is not None:
-            self.sd.get_initial_centroids()
         self._sd_thread_active = True
         # Make thread daemon for cleaner shutdown
         threading.Thread(target=self._sd_thread, daemon=True).start()
