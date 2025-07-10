@@ -64,8 +64,6 @@ class UtteranceModule(retico_core.AbstractModule):
         self.speaker_timeline = SortedDict()
         # Maintain timestamp of last text
         self.last_text = None
-        # Whether consective utterances from the same speaker should be merged
-        self.merge_utterances = merge_utterances
 
     def _add_new_utterance(self, um, speaker, text, add_set=None):
         if add_set == None:
@@ -94,7 +92,7 @@ class UtteranceModule(retico_core.AbstractModule):
         add_set = []
         for iu in self.current_output:
             # Check the original audio in timestamp for the speaker id
-            origin = iu.grounded_in.grounded_in.created_at
+            origin = iu.grounded_in.created_at
             # If this was an unconfirmed last speaker and the last speaker changed, recheck
             if self.last_text is not None and origin == old_last_speaker and new_last_speaker != old_last_speaker:
                 if self._closer_to(self.last_text, old_last_speaker, new_last_speaker):
