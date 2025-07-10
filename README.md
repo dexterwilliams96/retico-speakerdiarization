@@ -29,8 +29,7 @@ The module receives AudioIUs similar to ASR, it buffers audio from this input. W
 1. Buffered audio is collected and passed to a speechbrain encoder to obtain a speaker embedding
 2. Using the trained classifier predicts the speaker
 3. If the similarity is above a sceptical threshold, the embedding is added to the training data the model is retrained (if there enough new real embeddings) and the speaker ID is COMMITTED in an incremental unit
-4. Otherwise, the training data is not updated but the embedding and it's associated speaker ID are ADDED in an incremental unit
-Whenever, a new embedding is committed the centroids are updated. When this happens all IUs that are in an ADD but not COMMIT state, are checked again, following the same steps as above.
+4. Otherwise, the training data is not updated but the embedding and it's associated speaker ID are ADDED in an incremental unit. When this happens all IUs that are in an ADD but not COMMIT state, are checked again, following the same steps as above.
 
 ### Interpreting output IUs
 
