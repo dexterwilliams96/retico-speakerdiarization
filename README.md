@@ -28,7 +28,7 @@ conda install -c conda-forge 'ffmpeg<7'
 ```
 ### Explanation
 
-This module works under a two assumptions:
+This module works under a three assumptions:
 1. The number of speakers is known/specified before hand
 2. There are exactly two speakers (open to a PR to make this model handle multiple speakers)
 3. Each utterance (speech ending in silence) belongs to exactly one speaker
