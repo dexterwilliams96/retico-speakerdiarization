@@ -83,7 +83,7 @@ class SpeakerDiarization:
         silence_threshold=0.75,
         device="cpu",
         sceptical_threshold=0.4,
-        train_buffer_size=1,
+        train_buffer_size=5,
         audio_path='audio',
         compile_model=True
     ):
