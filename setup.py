@@ -40,6 +40,7 @@ config = {
         "torchaudio>=2.7.1,<3.0.0",
         "pydub>=0.25.1,<0.26.0",
         "webrtcvad>=2.0.10,<3.0.0",
+        "sortedcontainers>=2.4.0,<3.0.0",
         ],
     "packages": find_packages(),
     "name": "retico-speakerdiarization",
