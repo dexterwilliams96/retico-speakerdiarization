@@ -20,7 +20,7 @@ pip install --editable .
 
 ### Loading Initial Embeddings
 
-The module requires an audio recording (WAV) of each speaker. This is then used to generate some synthetic data for each speaker for a classifier.
+The module requires an audio recording (WAV) of each speaker. This is then used to generate some synthetic data for each speaker for a classifier. I strongly recommend using the included sample recorder to obtain these.
 
 You will need a backend to support `torchaudio.io` if you are loading initial wav files:
 ```bash
